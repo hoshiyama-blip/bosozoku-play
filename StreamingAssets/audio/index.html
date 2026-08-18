@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang='ja'>
+<head>
+<meta charset='utf-8'>
+<title>bosozoku audio</title>
+</head>
+<body style='margin:0;background:#000'>
+
+<!-- 音の素材。改変せずそのまま読み込む（ビルド時に src/parts/ から複製される）。
+     ⚠️ fetch ではなく script タグで読む。WKWebView の file:// は生成元が不明扱いで、
+        fetch は CORS で必ず失敗する（前のページが無音だった原因のひとつ）。 -->
+<script src='40-core-engine.js'></script>
+
+<script>
+(function(){
+'use strict';
+
+var PRESET_ID  = 'AT2_180';
+var GS_VERSION = 'v14';
+var OUT_TRIM   = 0.708;
+
+var stage = 0;          // どこまで進んだか（-1 は失敗）
+var ctx = null;         // AudioContext
+var node = null;        // AudioWorkletNode か ScriptProcessorNode
+var P = null;           // AudioParam のまとめ。無い経路では null
+var core = null;        // ScriptProcessor 経路だけ使う EngineCore の実体
+var started = false;
+var lastRpm = -1, postedRpm = -1e9, postedAt = 0;
+
+// ── ネイティブへの押し出し ─────────────────────────
+// ⚠️ ここが唯一の連絡路。iOS の evaluateJavaScript は非同期で戻り値が取れないので、
+//    回転数は**引っぱらせず押し出す**。
+function post(o){
+  try { window.webkit.messageHandlers.bosozoku.postMessage(o); } catch(e) {}
+}
+function mark(n){ stage = n; post({ stage:n }); }
+function oops(where, e){
+  stage = -1;
+  post({ stage:-1, err: where + ': ' + ((e && (e.name ? e.name + ' ' : '') + (e.message || e)) || String(e)) });
+}
+window.onerror = function(m, src, l, c){ post({ stage:-1, err:'onerror ' + m + ' @' + l + ':' + c }); };
+window.addEventListener('unhandledrejection', function(ev){
+  post({ stage:-1, err:'unhandled ' + ((ev.reason && ev.reason.message) || ev.reason) });
+});
+
+// ★★回転数だけ外から与えるための薄い皮
+//   音エンジンが受け取れるつまみは throttle / clutch / brake / gear の4つで、
+//   **回転数を直接指定する口が無い**。registerProcessor を横取りして、
+//   登録されるクラスを継承したものにすり替え、`rpmLock` という AudioParam を
+//   ひとつだけ足す。process() の頭で core.rpm に流し込む。0以下なら素の挙動。
+//   ★光さんの 40-core-engine.js は1文字も触っていない。WebGL版と同じ仕掛け。
+var SHIM = `
+try{
+  const __bzOrig = registerProcessor;
+  registerProcessor = function(name, cls){
+    class BzRpmLocked extends cls {
+      static get parameterDescriptors(){
+        return cls.parameterDescriptors.concat([
+          {name:'rpmLock', defaultValue:-1, minValue:-1, maxValue:20000, automationRate:'k-rate'}
+        ]);
+      }
+      process(inputs, outputs, params){
+        const v = params.rpmLock ? params.rpmLock[0] : -1;
+        if (v > 0 && this.core) this.core.rpm = v;
+        return super.process(inputs, outputs, params);
+      }
+    }
+    __bzOrig.call(globalThis, name, BzRpmLocked);
+  };
+}catch(e){ /* 皮が当たらなくても、音は素のまま鳴る */ }
+`;
+
+// 素材が本当に読めているか。ここで折れていたら file:// の道が間違っている
+if (typeof EngineCore !== 'function' || typeof PRESETS !== 'object' ||
+    typeof Biquad !== 'function' || typeof WORKLET_TAIL !== 'string') {
+  post({ stage:-1, err:'40-core-engine.js が読めていない（file:// の読み取り許可かパス違い）' });
+} else {
+  mark(1);
+}
+
+// ── 音を起こす。最初に画面を触ったあとに呼ばれる ─────────
+function boot(){
+  if (started || stage < 1) return;
+  started = true;
+  try {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    ctx = new Ctx({ latencyHint: 0 });
+    // WebKit 独自。これを playback にしておくと消音スイッチで消えない
+    try { if ('audioSession' in navigator) navigator.audioSession.type = 'playback'; } catch(e) {}
+    // ⚠️ await しない。WebKit は interrupted のとき resume() を棚上げして戻らないことがある
+    try { ctx.resume().catch(function(){}); } catch(e) {}
+    mark(2);
+
+    if (!ctx.audioWorklet) {
+      post({ note:'audioWorklet が無い → ScriptProcessor へ' });
+      viaScriptProcessor();
+      return;
+    }
+
+    // ★WebGL版とまったく同じ組み立て。順番が命。
+    //   SHIM は WORKLET_TAIL より**前**に置く。tail の中の
+    //   registerProcessor('engine-core', …) を横取りするため。
+    var src = 'const PRESETS=' + JSON.stringify(PRESETS) + ';\n'
+            + Biquad.toString() + '\n'
+            + EngineCore.toString() + '\n'
+            + SHIM + '\n'
+            + WORKLET_TAIL;
+
+    addModule(src);
+  } catch(e) {
+    oops('boot', e);
+  }
+}
+
+// モジュールの渡し方を3段で試す。
+// blob: が file:// 生成元で通るかは端末頼みなので、通らなければ data:、
+// それも駄目なら ScriptProcessor（遅延は増えるが音は同じ）。
+function addModule(src){
+  var url = null;
+  try { url = URL.createObjectURL(new Blob([src], { type:'application/javascript' })); } catch(e) {}
+
+  var viaData = function(){
+    var d;
+    try { d = 'data:application/javascript;charset=utf-8,' + encodeURIComponent(src); }
+    catch(e) { oops('data URL', e); viaScriptProcessor(); return; }
+    ctx.audioWorklet.addModule(d).then(function(){ mark(3); makeNode('data'); },
+      function(e){
+        post({ note:'data 不可: ' + ((e && e.message) || e) });
+        viaScriptProcessor();
+      });
+  };
+
+  if (!url) { viaData(); return; }
+  ctx.audioWorklet.addModule(url).then(function(){
+    try { URL.revokeObjectURL(url); } catch(e) {}
+    mark(3); makeNode('blob');
+  }, function(e){
+    try { URL.revokeObjectURL(url); } catch(_) {}
+    post({ note:'blob 不可: ' + ((e && e.message) || e) });
+    viaData();
+  });
+}
+
+function makeNode(how){
+  try {
+    // ⚠️ 名前は 'engine-core'。40-core-engine.js:3468 の registerProcessor と一致させる。
+    //    'engine-processor' はクラス名で、登録名ではない（ここを間違えて無音だった）
+    node = new AudioWorkletNode(ctx, 'engine-core', {
+      numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+      processorOptions: { preset: PRESET_ID, gsVersion: GS_VERSION }
+    });
+  } catch(e) { oops('AudioWorkletNode', e); viaScriptProcessor(); return; }
+
+  P = {
+    throttle: node.parameters.get('throttle'),
+    clutch:   node.parameters.get('clutch'),
+    brake:    node.parameters.get('brake'),
+    gear:     node.parameters.get('gear'),
+    // 皮が当たっていれば存在する。無ければ null ＝素の挙動
+    rpmLock:  node.parameters.get('rpmLock') || null
+  };
+
+  node.port.onmessage = function(e){
+    var d = e.data;
+    if (d && typeof d.rpm === 'number') telem(d.rpm);
+  };
+  // process() が一度でも例外を投げると、以後ブラウザは呼ばない＝完全無音
+  node.onprocessorerror = function(){ post({ stage:-1, err:'process() が落ちた' }); };
+
+  var master = ctx.createGain();
+  master.gain.value = OUT_TRIM;
+  node.connect(master);
+  master.connect(ctx.destination);
+
+  // ★AudioParam は触らない。既定が「停車してコールを切る」状態そのもの。
+  //   実測: clutch=0 切/1 繋、brake=1 保持、gear=1。
+  //   既定のまま ignite → アイドル 1,166rpm、全開 10,163rpm。
+  node.port.postMessage({ cmd:'ignite' });
+  // ⚠️ autoOn が既定で入っている。放っておくと勝手にコールを切り続ける
+  node.port.postMessage({ cmd:'autoOff' });
+
+  mark(4);
+  post({ note:'worklet(' + how + ') lock:' + (P.rpmLock ? 'on' : 'off')
+              + ' ' + Math.round(ctx.sampleRate) + 'Hz ' + ctx.state });
+}
+
+// ── 最後の砦。AudioWorklet がどうしても使えないとき ─────────
+// 音は同じで遅延だけ増える。無音より遥かにいい。
+// ★ここでは皮は要らない。EngineCore がこのスレッドに居るので rpm を直に書ける。
+function viaScriptProcessor(){
+  try {
+    core = new EngineCore(ctx.sampleRate, PRESETS[PRESET_ID], GS_VERSION);
+    core.ignite();
+    core.autoOn = false;
+    var sp = ctx.createScriptProcessor(2048, 0, 2);
+    var tick = 0, pend = -1;
+    sp.onaudioprocess = function(ev){
+      var c = core;
+      var L = ev.outputBuffer.getChannelData(0), R = ev.outputBuffer.getChannelData(1);
+      c.render(L, L.length, R);
+      tick += L.length;
+      // ⚠️ 音声コールバックの中から postMessage を投げると確実に音が飛ぶ。値だけ置く
+      if (tick >= 1536) { tick = 0; pend = c.rpm; }
+    };
+    var master = ctx.createGain();
+    master.gain.value = OUT_TRIM;
+    sp.connect(master);
+    master.connect(ctx.destination);
+    node = sp;
+    setInterval(function(){ if (pend >= 0) { telem(pend); pend = -1; } }, 32);
+    mark(4);
+    post({ note:'ScriptProcessor ' + Math.round(ctx.sampleRate) + 'Hz ' + ctx.state });
+  } catch(e) { oops('ScriptProcessor', e); }
+}
+
+// 回転数の押し出し。★間引く。1回ごとに JS→ネイティブを跨ぐと重い
+// （ワークレットは毎1536サンプル＝約31Hzで投げてくる）
+function telem(rpm){
+  lastRpm = rpm;
+  if (stage < 5) mark(5);
+  var now = (performance && performance.now) ? performance.now() : Date.now();
+  if (Math.abs(rpm - postedRpm) < 4 && (now - postedAt) < 120) return;
+  postedRpm = rpm; postedAt = now;
+  post({ rpm: rpm });
+}
+
+// ── 値の受け取り ───────────────────────────────
+function cl01(v){ return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+function apply(thr, cl, gear, rpmLock){
+  if (P) {
+    P.throttle.value = cl01(thr);
+    // ⚠️ clutch は 0=切る / 1=繋がる。逆に解釈すると 4,620rpm で頭打ちになる
+    P.clutch.value = cl01(cl);
+    // ⚠️ brake はゲームのブレーキではない。走行中の駆動系は荷重を受け切っているので常に1
+    P.brake.value = 1;
+    P.gear.value = gear > 0 ? 1 : 0;
+    if (P.rpmLock) P.rpmLock.value = rpmLock;
+  } else if (core) {
+    core.inThr = cl01(thr);
+    core.inCl = cl01(cl);
+    core.inBrake = 1;
+    core.gear = gear > 0 ? 1 : 0;
+    if (rpmLock > 0) core.rpm = rpmLock;
+  }
+}
+
+// ★ネイティブからはこの1本だけを叩く（呼び出し回数と文字数をとにかく減らす）
+window.bz = {
+  s: apply,
+  i: function(){ boot(); },
+  r: function(){ if (ctx && ctx.state === 'suspended') ctx.resume().catch(function(){}); },
+  q: function(){ post({ stage:stage, rpm:lastRpm, ctx: ctx ? ctx.state : 'none' }); }
+};
+
+// WebGL版と同じ名前も残す。切り分けのとき同じ手が使える
+window.bosozokuBridge = {
+  ignite: function(){ boot(); },
+  setRide: function(t, c, b, g){ apply(t, c, g, -1); },
+  setRpmLock: function(r){ if (!P || !P.rpmLock) return 0; P.rpmLock.value = r; return 1; },
+  getRpm: function(){ return lastRpm; },
+  command: function(msg){ if (node && node.port) node.port.postMessage(msg); },
+  inspect: function(){
+    return { stage:stage, rpm:lastRpm, ctx: ctx ? ctx.state : 'none',
+             lock: !!(P && P.rpmLock), fallback: !!core };
+  }
+};
+
+// 画面が戻ってきたら止まった音を起こし直す（iOS で割り込みが入ったとき用）
+document.addEventListener('visibilitychange', function(){
+  if (!document.hidden && ctx && ctx.state === 'suspended') ctx.resume().catch(function(){});
+});
+
+post({ pageReady: 1 });
+})();
+</script>
+</body>
+</html>

@@ -3,9 +3,48 @@
   <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Unity Web Player | 暴走族ライド</title>
+    <!-- ★携帯で開く前提。JSが走る前に効かせたいので静的に置く -->
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="theme-color" content="#000000">
+    <title>暴走族ライド</title>
     <link rel="shortcut icon" href="TemplateData/favicon.ico">
     <link rel="stylesheet" href="TemplateData/style.css">
+    <style>
+      /* ══════════════════════════════════════════════════════════════
+         ★携帯用。（2026-08-18・星山さんが iPhone で遊んで出た指摘から）
+
+         既定のテンプレートは **canvas を 1920×1080 の固定サイズ**で置く。
+         携帯では UA を見て「画面いっぱい」へ切り替わるが、
+         **`config.devicePixelRatio` を 1 に落とす行がコメントアウトされたまま**だった。
+         iPhone の devicePixelRatio は 3。＝ 画面の**9倍の画素**を毎フレーム描いていた。
+         URP の renderScale 0.8 を掛けても 5.8倍。**カクカクの主因はこれ。**
+         ══════════════════════════════════════════════════════════════ */
+      html, body {
+        margin: 0; padding: 0; height: 100%; width: 100%;
+        overflow: hidden; background: #000;
+        overscroll-behavior: none;              /* 引っぱって画面が動くのを止める */
+        -webkit-text-size-adjust: 100%;
+      }
+      #unity-container { position: fixed; inset: 0; }
+      #unity-canvas {
+        width: 100%; height: 100%; display: block;
+        touch-action: none;                     /* ★これが無いとタップがスクロールに取られる */
+        -webkit-tap-highlight-color: transparent;
+        background: #000;
+      }
+      /* 足元の Unity ロゴ帯は携帯では邪魔なだけ。消す */
+      #unity-footer { display: none !important; }
+      #unity-loading-bar { position: fixed; left: 0; right: 0; top: 45%; display: none; }
+      #unity-logo { margin: 0 auto 14px; }
+      #unity-progress-bar-empty { margin: 0 auto; }
+      #unity-load-text {
+        position: fixed; left: 0; right: 0; top: 56%;
+        text-align: center; color: #cfcfcf; font: 15px/1.6 -apple-system, sans-serif;
+      }
+      #unity-load-text small { color: #8a8a8a; display: block; font-size: 12px; }
+    </style>
   </head>
   <body>
     <div id="unity-container" class="unity-desktop">
@@ -16,6 +55,8 @@
           <div id="unity-progress-bar-full"></div>
         </div>
       </div>
+      <!-- ★何%まで来たか出す。棒だけだと「止まっているのか進んでいるのか」が分からない -->
+      <div id="unity-load-text">読み込み中 0%<small>初回だけ時間がかかります（約51MB）</small></div>
       <div id="unity-warning"> </div>
       <div id="unity-footer">
         <div id="unity-logo-title-footer"></div>
@@ -87,25 +128,25 @@
       // JS_FileSystem_Sync() behavior, but in future Unity version, this will be
       // expected to change.
 
-      if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
-        // Mobile device style: fill the whole browser client area with the game canvas:
-
-        var meta = document.createElement('meta');
-        meta.name = 'viewport';
-        meta.content = 'width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes';
-        document.getElementsByTagName('head')[0].appendChild(meta);
+      // ══════════════════════════════════════════════════════════════════
+      //  ★UA で分岐しない。**いつでも画面いっぱい**にする。
+      //    元のテンプレートは iPhone/Android の UA のときだけ画面いっぱいにして、
+      //    それ以外では 1920×1080 の固定サイズで置いていた。
+      //    ・確認用のブラウザ（UAが違う）では**下のボタンが画面の外**に出て押せない
+      //    ・実機だけ挙動が違うので、こちらで再現できない
+      //    → 分岐をやめる。実機と確認環境を同じにする。
+      // ══════════════════════════════════════════════════════════════════
+      {
         document.querySelector("#unity-container").className = "unity-mobile";
         canvas.className = "unity-mobile";
 
-        // To lower canvas resolution on mobile devices to gain some
-        // performance, uncomment the following line:
-        // config.devicePixelRatio = 1;
+        // ⚠️⚠️ **描く画素の数を画面と同じにする。**（2026-08-18 星山さん「カクカクする」）
+        //   iPhone の devicePixelRatio は 3。既定のままだと**画面の9倍の画素**を毎フレーム描く。
+        //   1 に固定すると 1/9。文字は少し粗くなるが、走っている画面では分からない。
+        //   ★ここは「絵の綺麗さ」ではなく「遊べるかどうか」の設定。
+        config.devicePixelRatio = 1;
 
 
-      } else {
-        // Desktop style: Render the game canvas in a window that can be maximized to fullscreen:
-        canvas.style.width = "1920px";
-        canvas.style.height = "1080px";
       }
 
       document.querySelector("#unity-loading-bar").style.display = "block";
@@ -115,8 +156,12 @@
       script.onload = () => {
         createUnityInstance(canvas, config, (progress) => {
           document.querySelector("#unity-progress-bar-full").style.width = 100 * progress + "%";
+          var lt = document.querySelector("#unity-load-text");
+          if (lt) lt.firstChild.nodeValue = "読み込み中 " + Math.round(progress * 100) + "%";
               }).then((unityInstance) => {
                 document.querySelector("#unity-loading-bar").style.display = "none";
+                var lt2 = document.querySelector("#unity-load-text");
+                if (lt2) lt2.style.display = "none";
                 document.querySelector("#unity-fullscreen-button").onclick = () => {
                   unityInstance.SetFullscreen(1);
                 };
